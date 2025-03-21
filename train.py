@@ -7,13 +7,13 @@ import numpy as np
 from collections import OrderedDict
 from contextlib import suppress
 from datetime import datetime
-from spikingjelly.clock_driven import functional
+from spikingjelly.activation_based import functional
 from spikingjelly.datasets.cifar10_dvs import CIFAR10DVS
 from spikingjelly.datasets.dvs128_gesture import DVS128Gesture
 import torch
 import torch.nn as nn
 import torchvision.utils
-import torchvision.transforms as transforms
+from torchvision import datasets, transforms
 from torch.nn.parallel import DistributedDataParallel as NativeDDP
 import torchinfo
 from timm.data import (
@@ -1005,7 +1005,8 @@ def main():
                 [
                     datetime.now().strftime("%Y%m%d-%H%M%S"),
                     safe_model_name(args.model),
-                    "data-" + args.dataset.split("/")[-1],
+                    # "data-" + args.dataset.split("/")[-1], modified for my implementation
+                    "data-" + str(args.dataset.get("name", "unknown")).split("/")[-1],
                     f"t-{args.time_steps}",
                     f"spike-{args.spike_mode}",
                 ]
@@ -1141,8 +1142,9 @@ def main():
 
     transforms_train, transforms_eval = None, None
 
-    # create the train and eval datasets
+   # create the train and eval datasets
     dataset_train, dataset_eval = None, None
+
     if args.dataset == "cifar10-dvs-tet":
         dataset_train = dvs_utils.DVSCifar10(
             root=os.path.join(args.data_dir, "train"),
@@ -1152,6 +1154,7 @@ def main():
             root=os.path.join(args.data_dir, "test"),
             train=False,
         )
+
     elif args.dataset == "cifar10-dvs":
         dataset = CIFAR10DVS(
             args.data_dir,
@@ -1160,9 +1163,8 @@ def main():
             split_by="number",
             transform=dvs_utils.Resize(64),
         )
-        dataset_train, dataset_eval = dvs_utils.split_to_train_test_set(
-            0.9, dataset, 10
-        )
+        dataset_train, dataset_eval = dvs_utils.split_to_train_test_set(0.9, dataset, 10)
+
     elif args.dataset == "gesture":
         dataset_train = DVS128Gesture(
             args.data_dir,
@@ -1178,25 +1180,45 @@ def main():
             frames_number=args.time_steps,
             split_by="number",
         )
+
+    elif "cifar10" in str(args.dataset).lower():  # ✅ Ensures CIFAR-10 is detected correctly
+                                                  # 이런 CIFAR
+        dataset_train = datasets.CIFAR10(
+            root=args.data_dir,
+            train=True,
+            transform=transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(mean=(0.4914, 0.4822, 0.4465), std=(0.247, 0.2435, 0.2616))
+            ]),
+            download=True,
+        )
+        dataset_eval = datasets.CIFAR10(
+            root=args.data_dir,
+            train=False,
+            transform=transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(mean=(0.4914, 0.4822, 0.4465), std=(0.247, 0.2435, 0.2616))
+            ]),
+            download=True,
+        )
+
     else:
         dataset_train = create_dataset(
-            args.dataset,
+            args.dataset["name"],
             root=args.data_dir,
             split=args.train_split,
             is_training=True,
             batch_size=args.batch_size,
             repeats=args.epoch_repeats,
             transform=transforms_train,
-            # download=True,
         )
         dataset_eval = create_dataset(
-            args.dataset,
+            args.dataset["name"],  # Fixed here
             root=args.data_dir,
             split=args.val_split,
             is_training=False,
             batch_size=args.batch_size,
             transform=transforms_eval,
-            # download=True,
         )
 
     # setup mixup / cutmix

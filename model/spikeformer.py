@@ -12,13 +12,11 @@ from timm.models.layers import trunc_normal_
 from timm.models.registry import register_model  
 # import _cfg from timm.models.vision_transformer
 from timm.models.vision_transformer import _cfg  
-# import multi-step lif node classes from spikingjelly.clock_driven.neuron
-from spikingjelly.activation_based import (  # replaces from spikingjelly.clock_driven.neuron import
-    # import multi-step lif node class
-    LIFNODE, # reokace MultiStepLIFNode,  
-    # import multi-step parametric lif node class
-    ParametricLIFNode # replaces MultiStepParametricLIFNode,  
-)  
+# import lif node classes from spikingjelly.activation_based.neuron
+from spikingjelly.activation_based.neuron import (
+    LIFNode,
+    ParametricLIFNode   
+)
 # import everything from module
 from module import *  
 

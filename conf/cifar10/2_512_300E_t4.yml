@@ -1,6 +1,13 @@
 # Dataset / Model parameters
 data_dir: ./data/
-dataset: torch/cifar10
+
+dataset:
+  name: cifar10
+  root: ./data/cifar10
+  train: True
+  download: False  # Change to False since we downloaded manually
+
+
 pretrained: False
 num_classes: 10
 num_heads: 8

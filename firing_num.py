@@ -8,7 +8,7 @@ import logging
 from collections import OrderedDict
 from contextlib import suppress
 from datetime import datetime
-from spikingjelly.clock_driven import functional
+from spikingjelly.activation_based import functional
 from spikingjelly.datasets.cifar10_dvs import CIFAR10DVS
 from spikingjelly.datasets.dvs128_gesture import DVS128Gesture
 
