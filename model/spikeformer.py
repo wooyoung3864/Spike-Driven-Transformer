@@ -22,7 +22,7 @@ from module import *
 
 
 # define spike driven transformer class inheriting from nn.module
-class SpikeDrivenTransformer(nn.Module):  
+class SpikeDrivenTransformer(nn.Module):      
     # define initializer method
     def __init__(  
         self,  # self reference
@@ -134,6 +134,10 @@ class SpikeDrivenTransformer(nn.Module):
             nn.Linear(embed_dims, num_classes) if num_classes > 0 else nn.Identity()  # use linear layer if num_classes > 0 else identity
         )  # end classification head instantiation
         self.apply(self._init_weights)  # apply weight initialization
+        
+    # hooks for tensor extraction & data flow visualization
+    def _init_hooks(self):
+        self.hook = {}
 
     # define weights initialization function
     def _init_weights(self, m):  
@@ -159,6 +163,8 @@ class SpikeDrivenTransformer(nn.Module):
 
     # define forward function
     def forward(self, x, hook=None):  
+        if hook is None:
+            hook = {} # initialize hook if empty
         if len(x.shape) < 5:  # if input x has less than 5 dimensions
             x = (x.unsqueeze(0)).repeat(self.T, 1, 1, 1, 1)  # add time dimension and repeat x for T steps
         else:  # else if x already has 5 dimensions

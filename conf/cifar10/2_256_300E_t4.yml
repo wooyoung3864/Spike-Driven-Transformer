@@ -57,9 +57,16 @@ lr: 3e-4
 min_lr: 1e-5
 sched: cosine
 weight_decay: 6e-2
-epochs: 300
-cooldown_epochs: 10
-warmup_epochs: 20
+
+# 05/03 (wyjung): run mini-test runs for ablation study #1
+epochs: 15
+cooldown_epochs: 1
+warmup_epochs: 2
+
+# epochs: 300
+# cooldown_epochs: 10
+# warmup_epochs: 20
+
 warmup_lr: 1e-6
 opt: adamw
 smoothing: 0.1

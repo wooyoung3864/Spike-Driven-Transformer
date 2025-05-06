@@ -154,6 +154,7 @@ class MS_SPS(nn.Module):  # define ms_sps class inheriting from nn.module
             x = self.maxpool3(x)  # apply fourth maxpool2d layer
             ratio *= 2  # update ratio by multiplying by 2
 
+        # residual connection (Membrane Shortcut)
         x_feat = x  # store feature output before lif activation as x_feat
         x = self.proj_lif3(x.reshape(T, B, -1, H // ratio, W // ratio).contiguous())  # reshape x and apply lif activation for fourth projection
         if hook is not None:  # if hook is provided

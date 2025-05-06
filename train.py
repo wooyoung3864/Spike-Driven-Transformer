@@ -2,7 +2,9 @@ import argparse
 import time
 import yaml
 import os
+import sys
 import logging
+logging.getLogger("timm.utils.checkpoint_saver").setLevel(logging.WARNING)
 import numpy as np
 from collections import OrderedDict
 from contextlib import suppress
@@ -43,7 +45,21 @@ from timm.loss import (
 from timm.optim import create_optimizer_v2, optimizer_kwargs
 from timm.scheduler import create_scheduler
 from timm.utils import ApexScaler, NativeScaler
-import model, dvs_utils, criterion
+import model
+import dvs_utils
+import criterion
+
+# 05/02 update (wyjung): modularized utility functions (output image saving,  SynOps estimation)
+# for metrics logging (energy, SynOps, #params, model size, etc)
+from hooks.syops_hook import estimate_ops
+from hooks.output_images_hook import OutputImageSaver
+
+# 05/02 (wyjung): enabled native AMP mode and replaced deprecated function call
+from functools import partial
+from torch.cuda.amp import autocast as autocast_cm
+
+# 05/03 (wyjung): added import for toggle_sn.py
+from utils.toggle_sn import apply_toggle
 
 try:
     from apex import amp
@@ -83,13 +99,16 @@ def resume_checkpoint(
 
             if optimizer is not None and "optimizer" in checkpoint:
                 if log_info:
-                    _logger.info("Restoring optimizer state from checkpoint...")
+                    _logger.info(
+                        "Restoring optimizer state from checkpoint...")
                 optimizer.load_state_dict(checkpoint["optimizer"])
 
             if loss_scaler is not None and loss_scaler.state_dict_key in checkpoint:
                 if log_info:
-                    _logger.info("Restoring AMP loss scaler state from checkpoint...")
-                loss_scaler.load_state_dict(checkpoint[loss_scaler.state_dict_key])
+                    _logger.info(
+                        "Restoring AMP loss scaler state from checkpoint...")
+                loss_scaler.load_state_dict(
+                    checkpoint[loss_scaler.state_dict_key])
 
             if "epoch" in checkpoint:
                 resume_epoch = checkpoint["epoch"]
@@ -311,7 +330,7 @@ parser.add_argument(
     nargs="+",
     default=None,
     metavar="STD",
-    help="Override std deviation of of dataset",
+    help="Override std deviation of dataset",
 )
 parser.add_argument(
     "--interpolation",
@@ -728,6 +747,23 @@ parser.add_argument(
 )
 
 # Misc
+
+# 05/03 (wyjung): added arg for Ablation Study #1: disable SN (LIF) in different stages of the network
+parser.add_argument(
+    "--lif_toggle",
+    type=str,
+    choices=["S0", "S1", "S2"],
+    default=None,
+    help="If set, disable the LIFs in stage S0 (MS_SPS), S1 (RPE), or S2 (encoder blocks) for ablation"
+)
+
+# 05/02 (wyjung): args for SyOps estimation
+parser.add_argument(
+    "--energy_per_synop_pj",
+    type=float, default=0.9,
+    help="Energy (pJ) per accumulate operation"
+)
+
 parser.add_argument(
     "--seed", type=int, default=42, metavar="S", help="random seed (default: 42)"
 )
@@ -764,24 +800,28 @@ parser.add_argument(
     "--save-images",
     action="store_true",
     default=False,
-    help="save images of input bathes every log interval for debugging",
+    help="save images of input batches every log interval for debugging",
 )
+# 05/02 (wyjung): set amp to True
 parser.add_argument(
     "--amp",
     action="store_true",
-    default=False,
+    # default=False,
+    default=True,
     help="use NVIDIA Apex AMP or Native AMP for mixed precision training",
 )
 parser.add_argument(
     "--apex-amp",
     action="store_true",
-    default=False,
+    # default=False,
+    default=True,
     help="Use NVIDIA Apex AMP mixed precision",
 )
 parser.add_argument(
     "--native-amp",
     action="store_true",
-    default=False,
+    # default=False,
+    default=True,
     help="Use Native Torch AMP mixed precision",
 )
 parser.add_argument(
@@ -881,15 +921,43 @@ def _parse_args():
     # The main arg parser parses the rest of the args, the usual
     # defaults will have been overridden if config file specified.
     args = parser.parse_args(remaining)
+    
+    # 05/03 (wyjung): parse args for lif_toggle
+    args.S0 = (args.lif_toggle == "S0")
+    args.S1 = (args.lif_toggle == "S1")
+    args.S2 = (args.lif_toggle == "S2")
 
     # Cache the args as a text string to save them in the output dir later
     args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)
     return args, args_text
 
 
+def extract_attention_hook_output(hook, output_dir, epoch=None):
+    os.makedirs(os.path.join(output_dir, "attention_maps"), exist_ok=True)
+    for key, tensor in hook.items():
+        if tensor is None:
+            continue
+        avg_tensor = tensor.detach().mean(0).cpu().numpy()  # average over time or batch
+        name = f"{key}_epoch{epoch}.npy" if epoch is not None else f"{key}.npy"
+        path = os.path.join(output_dir, "attention_maps", name)
+        np.save(path, avg_tensor)
+
+
+def save_attention_map_from_forward(model, x, output_dir, epoch=None):
+    model.eval()
+    with torch.no_grad():
+        _, hook = model(x.cuda(), hook={})
+    extract_attention_hook_output(hook, output_dir, epoch)
+
+
 def main():
     setup_default_logging()
     args, args_text = _parse_args()
+
+    # hook image folder timestamp generation
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_image_dir = os.path.join("hook_images", run_id)
+    # base_image_dir = os.path.join("mj", run_id)
 
     if args.log_wandb:
         if has_wandb:
@@ -910,7 +978,8 @@ def main():
     if args.distributed:
         args.device = "cuda:%d" % args.local_rank
         torch.cuda.set_device(args.local_rank)
-        torch.distributed.init_process_group(backend="nccl", init_method="env://")
+        torch.distributed.init_process_group(
+            backend="nccl", init_method="env://")
         args.world_size = torch.distributed.get_world_size()
         args.rank = torch.distributed.get_rank()
         _logger.info(
@@ -918,7 +987,7 @@ def main():
             % (args.rank, args.world_size)
         )
     else:
-        _logger.info("Training with a single process on 1 GPUs.")
+        _logger.info("Training with a single process on 1 GPU.")
     assert args.rank >= 0
 
     # resolve AMP arguments based on PyTorch / Apex availability
@@ -975,15 +1044,19 @@ def main():
         dvs_mode=args.dvs_mode,
         TET=args.TET,
     )
+    
+    # apply toggle_sn to disable LIFs in different stages of the network
+    apply_toggle(model, args)
+    
     if args.local_rank == 0:
         _logger.info(f"Creating model {args.model}")
-        _logger.info(
-            str(
-                torchinfo.summary(
-                    model, (2, args.in_channels, args.img_size, args.img_size)
-                )
-            )
+        # suppress the built‐in print and just capture the returned summary
+        summary_obj = torchinfo.summary(
+           model,
+           (2, args.in_channels, args.img_size, args.img_size),
+           verbose=0
         )
+        _logger.info(str(summary_obj))
 
     if args.num_classes is None:
         assert hasattr(
@@ -998,6 +1071,10 @@ def main():
     )
     output_dir = None
     if args.rank == 0:
+        # if epoch % 10 == 0:
+        #     dummy_x, _ = next(iter(loader_eval))
+        #     save_attention_map_from_forward(model, dummy_x[:8], output_dir, epoch)  # small batch
+
         if args.experiment:
             exp_name = args.experiment
         else:
@@ -1006,7 +1083,8 @@ def main():
                     datetime.now().strftime("%Y%m%d-%H%M%S"),
                     safe_model_name(args.model),
                     # "data-" + args.dataset.split("/")[-1], modified for my implementation
-                    "data-" + str(args.dataset.get("name", "unknown")).split("/")[-1],
+                    "data-" + str(args.dataset.get("name",
+                                  "unknown")).split("/")[-1],
                     f"t-{args.time_steps}",
                     f"spike-{args.spike_mode}",
                 ]
@@ -1071,11 +1149,14 @@ def main():
         loss_scaler = ApexScaler()
         if args.local_rank == 0:
             _logger.info("Using NVIDIA APEX AMP. Training in mixed precision.")
+    # 05/02 (wyjung): torch.amp.cuda.autocast is deprecated.
+    # ported to torch.amp.autocast.
     elif use_amp == "native":
-        amp_autocast = torch.cuda.amp.autocast
+        amp_autocast = partial(torch.amp.autocast, device_type="cuda")
         loss_scaler = NativeScaler()
         if args.local_rank == 0:
-            _logger.info("Using native Torch AMP. Training in mixed precision.")
+            _logger.info(
+                "Using native Torch AMP. Training in mixed precision.")
     else:
         if args.local_rank == 0:
             _logger.info("AMP not enabled. Training in float32.")
@@ -1109,12 +1190,14 @@ def main():
             # Apex DDP preferred unless native amp is activated
             if args.local_rank == 0:
                 _logger.info("Using NVIDIA APEX DistributedDataParallel.")
-            model = ApexDDP(model, delay_allreduce=True, find_unused_parameters=True)
+            model = ApexDDP(model, delay_allreduce=True,
+                            find_unused_parameters=True)
         else:
             if args.local_rank == 0:
                 _logger.info("Using native Torch DistributedDataParallel.")
             model = NativeDDP(
-                model, device_ids=[args.local_rank], find_unused_parameters=True
+                model, device_ids=[
+                    args.local_rank], find_unused_parameters=True
             )  # can use device str in Torch >= 1.1
         # NOTE: EMA model does not need to be wrapped by DDP
 
@@ -1163,7 +1246,8 @@ def main():
             split_by="number",
             transform=dvs_utils.Resize(64),
         )
-        dataset_train, dataset_eval = dvs_utils.split_to_train_test_set(0.9, dataset, 10)
+        dataset_train, dataset_eval = dvs_utils.split_to_train_test_set(
+            0.9, dataset, 10)
 
     elif args.dataset == "gesture":
         dataset_train = DVS128Gesture(
@@ -1181,25 +1265,27 @@ def main():
             split_by="number",
         )
 
-    elif "cifar10" in str(args.dataset).lower():  # ✅ Ensures CIFAR-10 is detected correctly
-                                                  # 이런 CIFAR
+    # Ensures CIFAR-10 is detected correctly
+    elif "cifar10" in str(args.dataset).lower():
         dataset_train = datasets.CIFAR10(
             root=args.data_dir,
             train=True,
             transform=transforms.Compose([
                 transforms.ToTensor(),
-                transforms.Normalize(mean=(0.4914, 0.4822, 0.4465), std=(0.247, 0.2435, 0.2616))
+                transforms.Normalize(
+                    mean=(0.4914, 0.4822, 0.4465), std=(0.247, 0.2435, 0.2616))
             ]),
-            download=True,
+            download=False,  # change to True to download
         )
         dataset_eval = datasets.CIFAR10(
             root=args.data_dir,
             train=False,
             transform=transforms.Compose([
                 transforms.ToTensor(),
-                transforms.Normalize(mean=(0.4914, 0.4822, 0.4465), std=(0.247, 0.2435, 0.2616))
+                transforms.Normalize(
+                    mean=(0.4914, 0.4822, 0.4465), std=(0.247, 0.2435, 0.2616))
             ]),
-            download=True,
+            download=False,  # change to True to download
         )
 
     else:
@@ -1335,7 +1421,8 @@ def main():
     elif mixup_active:
         # smoothing is handled with mixup target transform
         if args.bce_loss:
-            train_loss_fn = BinaryCrossEntropy(target_threshold=args.bce_target_thresh)
+            train_loss_fn = BinaryCrossEntropy(
+                target_threshold=args.bce_target_thresh)
         else:
             train_loss_fn = SoftTargetCrossEntropy()
     elif args.smoothing:
@@ -1344,12 +1431,20 @@ def main():
                 smoothing=args.smoothing, target_threshold=args.bce_target_thresh
             )
         else:
-            train_loss_fn = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
+            train_loss_fn = LabelSmoothingCrossEntropy(
+                smoothing=args.smoothing)
     else:
         train_loss_fn = nn.CrossEntropyLoss()
 
     train_loss_fn = train_loss_fn.cuda()
     validate_loss_fn = nn.CrossEntropyLoss().cuda()
+
+    # if args.eval:
+    #    eval_metrics = validate(
+    #    model, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast
+    # )
+    # _logger.info("*** Evaluation-only run complete.")
+    # return
 
     # setup checkpoint saver and eval metric tracking
     eval_metric = args.eval_metric
@@ -1374,10 +1469,24 @@ def main():
 
     try:
         for epoch in range(start_epoch, num_epochs):
+            # determine whether this is a sample epoch
+            is_sample_epoch = (
+                (epoch == start_epoch)
+                or (epoch <= 20 and epoch % 5 == 0)
+                or (epoch > 20 and epoch % 50 == 0)
+                or (epoch == num_epochs - 1)
+            )
+
+            # 05/02 update (wyjung): modularized image saving hook.
+            saver_imgs = None
+            if is_sample_epoch and args.local_rank == 0:
+                epoch_dir = os.path.join(base_image_dir, f"epoch_{epoch}")
+                saver_imgs = OutputImageSaver(epoch_dir, sample_batches=(0, 100, 156))
+            else:
+                saver_imgs = None
+
             if args.distributed and hasattr(loader_train.sampler, "set_epoch"):
                 loader_train.sampler.set_epoch(epoch)
-
-            # eval_metrics = validate(model, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast)
 
             train_metrics = train_one_epoch(
                 epoch,
@@ -1399,54 +1508,60 @@ def main():
 
             if args.distributed and args.dist_bn in ("broadcast", "reduce"):
                 if args.local_rank == 0:
-                    _logger.info("Distributing BatchNorm running means and vars")
+                    _logger.info(
+                        "Distributing BatchNorm running means and vars")
                 distribute_bn(model, args.world_size, args.dist_bn == "reduce")
 
             eval_metrics = validate(
-                model, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast
+                model, loader_eval, validate_loss_fn, args,
+                amp_autocast=amp_autocast, epoch_dir=epoch_dir, img_saver=saver_imgs # pass the helper
             )
 
-            if model_ema is not None and not args.model_ema_force_cpu:
-                if args.distributed and args.dist_bn in ("broadcast", "reduce"):
-                    distribute_bn(model_ema, args.world_size, args.dist_bn == "reduce")
-                ema_eval_metrics = validate(
-                    model_ema.module,
-                    loader_eval,
-                    validate_loss_fn,
-                    args,
-                    amp_autocast=amp_autocast,
-                    log_suffix=" (EMA)",
-                )
-                eval_metrics = ema_eval_metrics
+            # 05/02 update (wyjung): add SynOps estimation logic
+            # Recompute SynOps/energy dynamically based on current firing behavior
+            # optimization: run only once every 5 epochs
+            # 1) SyOps every 5 epochs
+            if args.local_rank == 0 and epoch % 5 == 0:
+                try:
+                    syops_metrics = estimate_ops(model,
+                                # remove args.time_steps, 
+                                input_size=(args.in_channels,
+                                            args.img_size, args.img_size),
+                                dataloader=loader_eval,
+                                spike_ac_energy_pj=args.energy_per_synop_pj,
+                                spike_mac_energy_pj=4.6,)
+                    _logger.info(
+                        f"[epoch {epoch}] SyOps estimate (dynamic): "
+                        f"ACs={syops_metrics['acs_G']:.2f} G, "
+                        f"MACs={syops_metrics['macs_G']:.2f} G, "
+                        f"Energy~={syops_metrics['energy_mJ']:.2f} mJ"
+                    )
+                    eval_metrics.update(syops_metrics)
+                except Exception as e:
+                    _logger.warning(f"[epoch {epoch}] SyOps estimation failed: {e}")
 
-            if lr_scheduler is not None:
-                # step LR for next epoch
-                lr_scheduler.step(epoch + 1, eval_metrics[eval_metric])
-
-            if output_dir is not None:
-                update_summary(
-                    epoch,
-                    train_metrics,
-                    eval_metrics,
-                    os.path.join(output_dir, "summary.csv"),
-                    write_header=best_metric is None,
-                    log_wandb=args.log_wandb and has_wandb,
-                )
+            # 2) Write summary & save checkpoint every epoch
+            update_summary(
+                epoch,
+                train_metrics,
+                eval_metrics,
+                os.path.join(output_dir, "summary.csv"),
+                write_header=(epoch == start_epoch),    # header only on very first epoch
+                log_wandb=args.log_wandb and has_wandb,
+            )
 
             if saver is not None:
-                # save proper checkpoint with eval metric
                 save_metric = eval_metrics[eval_metric]
                 best_metric, best_epoch = saver.save_checkpoint(
                     epoch, metric=save_metric
                 )
-                _logger.info(
-                    "*** Best metric: {0} (epoch {1})".format(best_metric, best_epoch)
-                )
+                _logger.info(f"*** Best metric: {best_metric:.2f} (epoch {best_epoch})")
 
     except KeyboardInterrupt:
         pass
     if best_metric is not None:
-        _logger.info("*** Best metric: {0} (epoch {1})".format(best_metric, best_epoch))
+        _logger.info(
+            "*** Best metric: {0} (epoch {1})".format(best_metric, best_epoch))
 
 
 def train_one_epoch(
@@ -1476,7 +1591,8 @@ def train_one_epoch(
     sample_number = 0
     start_time = time.time()
 
-    second_order = hasattr(optimizer, "is_second_order") and optimizer.is_second_order
+    second_order = hasattr(
+        optimizer, "is_second_order") and optimizer.is_second_order
     batch_time_m = AverageMeter()
     data_time_m = AverageMeter()
     losses_m = AverageMeter()
@@ -1510,7 +1626,8 @@ def train_one_epoch(
             input = input.contiguous(memory_format=torch.channels_last)
 
         with amp_autocast():
-            output = model(input)[0]
+            # output = model(input)[0] with
+            output, hook = model(input, hook={})
             if args.TET:
                 loss = criterion.TET_loss(
                     output, target, loss_fn, means=args.TET_means, lamb=args.TET_lamb
@@ -1538,7 +1655,8 @@ def train_one_epoch(
             loss.backward(create_graph=second_order)
             if args.clip_grad is not None:
                 dispatch_clip_grad(
-                    model_parameters(model, exclude_head="agc" in args.clip_mode),
+                    model_parameters(
+                        model, exclude_head="agc" in args.clip_mode),
                     value=args.clip_grad,
                     mode=args.clip_mode,
                 )
@@ -1574,8 +1692,10 @@ def train_one_epoch(
                         100.0 * batch_idx / last_idx,
                         loss=losses_m,
                         batch_time=batch_time_m,
-                        rate=input.size(0) * args.world_size / batch_time_m.val,
-                        rate_avg=input.size(0) * args.world_size / batch_time_m.avg,
+                        rate=input.size(0) * args.world_size /
+                        batch_time_m.val,
+                        rate_avg=input.size(
+                            0) * args.world_size / batch_time_m.avg,
                         lr=lr,
                         data_time=data_time_m,
                     )
@@ -1584,7 +1704,8 @@ def train_one_epoch(
                 if args.save_images and output_dir:
                     torchvision.utils.save_image(
                         input,
-                        os.path.join(output_dir, "train-batch-%d.jpg" % batch_idx),
+                        os.path.join(
+                            output_dir, "train-batch-%d.jpg" % batch_idx),
                         padding=0,
                         normalize=True,
                     )
@@ -1597,7 +1718,8 @@ def train_one_epoch(
             saver.save_recovery(epoch, batch_idx=batch_idx)
 
         if lr_scheduler is not None:
-            lr_scheduler.step_update(num_updates=num_updates, metric=losses_m.avg)
+            lr_scheduler.step_update(
+                num_updates=num_updates, metric=losses_m.avg)
 
         end = time.time()
         # end for
@@ -1605,11 +1727,12 @@ def train_one_epoch(
     if hasattr(optimizer, "sync_lookahead"):
         optimizer.sync_lookahead()
     if args.local_rank == 0:
-        _logger.info(f"samples / s = {sample_number / (time.time() - start_time): .3f}")
+        _logger.info(
+            f"samples / s = {sample_number / (time.time() - start_time): .3f}")
     return OrderedDict([("loss", losses_m.avg)])
 
 
-def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix=""):
+def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix="", epoch_dir=None, img_saver=None): # 05/02 (wyjung): added img_saver to params
     batch_time_m = AverageMeter()
     losses_m = AverageMeter()
     top1_m = AverageMeter()
@@ -1636,17 +1759,17 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix="")
                 input = input.contiguous(memory_format=torch.channels_last)
 
             with amp_autocast():
-                output = model(input)
+                output, hook = model(input, hook={})
             if isinstance(output, (tuple, list)):
                 output = output[0]
             if args.TET:
                 output = output.mean(0)
 
-            # augmentation reduction
             reduce_factor = args.tta
             if reduce_factor > 1:
-                output = output.unfold(0, reduce_factor, reduce_factor).mean(dim=2)
-                target = target[0 : target.size(0) : reduce_factor]
+                output = output.unfold(
+                    0, reduce_factor, reduce_factor).mean(dim=2)
+                target = target[0: target.size(0): reduce_factor]
 
             if (target >= 1000).sum() != 0 or (target < 0).sum() != 0:
                 print(target)
@@ -1670,9 +1793,8 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix="")
 
             batch_time_m.update(time.time() - end)
             end = time.time()
-            if args.local_rank == 0 and (
-                last_batch or batch_idx % args.log_interval == 0
-            ):
+
+            if args.local_rank == 0 and (last_batch or batch_idx % args.log_interval == 0):
                 log_name = "Test" + log_suffix
                 _logger.info(
                     "{0}: [{1:>4d}/{2}]  "
@@ -1690,10 +1812,23 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix="")
                     )
                 )
 
-    metrics = OrderedDict(
-        [("loss", losses_m.avg), ("top1", top1_m.avg), ("top5", top5_m.avg)]
-    )
+            # after computing loss/acc
+            if img_saver is not None and hook is not None:
+                # de-normalise input if you normalised it earlier
+                raw_in = None
+                if batch_idx in img_saver.sample_batches:
+                    raw_in = input.clone()
+                    if raw_in.shape[1] == 3:           # un-normalise CIFAR/Imagenet
+                        mean = torch.tensor([0.4914,0.4822,0.4465], device=raw_in.device).view(1,3,1,1)
+                        std  = torch.tensor([0.2470,0.2435,0.2616], device=raw_in.device).view(1,3,1,1)
+                        raw_in = raw_in * std + mean
+                img_saver.dump(batch_idx, hook, raw_in)
 
+    metrics = OrderedDict([
+        ("loss", losses_m.avg),
+        ("top1", top1_m.avg),
+        ("top5", top5_m.avg)
+    ])
     return metrics
 
 
